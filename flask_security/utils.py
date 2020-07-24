@@ -1072,7 +1072,7 @@ def password_complexity_validator(password, is_register, **kwargs):
             if kwargs:
                 user_info = kwargs.values()
         results = zxcvbn.zxcvbn(password, user_inputs=user_info)
-        if results["score"] > 2:
+        if results["score"] > 1:#ssmith
             # Good or Strong
             return None
         # Should we return suggestions? Default forms don't really know what to do.
