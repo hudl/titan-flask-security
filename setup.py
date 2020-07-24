@@ -79,7 +79,7 @@ setup(
         "Issue tracker": "https://github.com/Flask-Middleware/flask-security/issues",
     },
     packages=['flask_security'],
-    package_dir={'flask_security': 'src'}
+    package_dir={'flask_security': 'flask_security'}
     # packages=packages,
     # zip_safe=False,
     # include_package_data=True,
