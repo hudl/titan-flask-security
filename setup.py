@@ -1,7 +1,8 @@
 """Simple security for Flask apps."""
 
 import re
-from setuptools import find_packages, setup
+# from setuptools import find_packages, setup
+from distutils.core import setup
 
 with open("README.rst") as f:
     readme = f.read()
