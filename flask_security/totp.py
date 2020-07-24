@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.totp
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -11,7 +12,7 @@
 from passlib.totp import TOTP, TokenError
 
 
-class Totp:
+class Totp(object):
     """ Encapsulate usage of Passlib TOTP functionality.
 
     Flask-Security doesn't implement any replay-attack protection out of the box

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.recoverable
     ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -17,7 +18,6 @@ from .utils import (
     get_token_status,
     hash_data,
     hash_password,
-    send_mail,
     url_for_security,
     verify_hash,
 )
@@ -37,7 +37,7 @@ def send_reset_password_instructions(user):
     reset_link = url_for_security("reset_password", token=token, _external=True)
 
     if config_value("SEND_PASSWORD_RESET_EMAIL"):
-        send_mail(
+        _security._send_mail(
             config_value("EMAIL_SUBJECT_PASSWORD_RESET"),
             user.email,
             "reset_instructions",
@@ -56,7 +56,7 @@ def send_password_reset_notice(user):
     :param user: The user to send the notice to
     """
     if config_value("SEND_PASSWORD_RESET_NOTICE_EMAIL"):
-        send_mail(
+        _security._send_mail(
             config_value("EMAIL_SUBJECT_PASSWORD_NOTICE"),
             user.email,
             "reset_notice",
@@ -70,7 +70,7 @@ def generate_reset_password_token(user):
     :param user: The user to work with
     """
     password_hash = hash_data(user.password) if user.password else None
-    data = [str(user.fs_uniquifier), password_hash]
+    data = [str(user.id), password_hash]
     return _security.reset_serializer.dumps(data)
 
 
@@ -100,6 +100,8 @@ def update_password(user, password):
     :param password: The unhashed new password
     """
     user.password = hash_password(password)
+    if config_value("BACKWARDS_COMPAT_AUTH_TOKEN_INVALID"):
+        _datastore.set_uniquifier(user)
     _datastore.put(user)
     send_password_reset_notice(user)
     password_reset.send(app._get_current_object(), user=user)

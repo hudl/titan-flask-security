@@ -26,7 +26,7 @@ from sqlalchemy.sql import func
 from flask_security import RoleMixin, UserMixin
 
 
-class FsModels:
+class FsModels(object):
     """
     Helper class for model mixins.
     This records the ``db`` (which is a Flask-SqlAlchemy object) for use in
@@ -77,7 +77,7 @@ class FsUserMixin(UserMixin):
     password = Column(String(255), nullable=False)
     active = Column(Boolean(), nullable=False)
 
-    # Flask-Security user identifier
+    # Faster token checking
     fs_uniquifier = Column(String(64), unique=True, nullable=False)
 
     # confirmable
@@ -117,7 +117,7 @@ These are placeholders - not current used
 """
 
 
-class FsOauth2ClientMixin:
+class FsOauth2ClientMixin(object):
     """ Oauth2 client """
 
     id = Column(String(64), primary_key=True)
@@ -138,7 +138,7 @@ class FsOauth2ClientMixin:
     redirect_uris = Column(UnicodeText())
 
 
-class FsTokenMixin:
+class FsTokenMixin(object):
     """ (Bearer) Tokens that have been given out """
 
     id = Column(Integer, primary_key=True)

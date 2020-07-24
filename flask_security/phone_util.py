@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.phone_util
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -13,26 +14,17 @@
 from .utils import config_value, get_message
 
 
-class PhoneUtil:
+class PhoneUtil(object):
     """
     Provide parsing and validation for user inputted phone numbers.
     Subclass this to use a different underlying phone number parsing library.
 
     To provide your own implementation, pass in the class as ``phone_util_cls``
-    at init time. Your class will be instantiated once as part of app initialization.
+    at init time. Your class will be instantiated once prior to the first
+    request being handled.
 
     .. versionadded:: 3.4.0
-
-    .. versionchanged:: 4.0.0
-        __init__ takes app argument
     """
-
-    def __init__(self, app):
-        """ Instantiate class.
-
-        :param app: The Flask application being initialized.
-        """
-        pass
 
     def validate_phone_number(self, input_data):
         """ Return ``None`` if a valid phone number else an error message. """

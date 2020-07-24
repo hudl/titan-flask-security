@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.core
     ~~~~~~~~~~~~~~~~~~~
@@ -13,6 +14,7 @@
 
 from datetime import datetime, timedelta
 import warnings
+import sys
 
 import pkg_resources
 from flask import _request_ctx_stack, current_app, render_template
@@ -24,7 +26,7 @@ from flask_principal import Identity, Principal, RoleNeed, UserNeed, identity_lo
 from itsdangerous import URLSafeTimedSerializer
 from passlib.context import CryptContext
 from werkzeug.datastructures import ImmutableList
-from werkzeug.local import LocalProxy
+from werkzeug.local import LocalProxy, Local
 
 from .decorators import (
     default_reauthn_handler,
@@ -42,10 +44,10 @@ from .forms import (
     SendConfirmationForm,
     TwoFactorVerifyCodeForm,
     TwoFactorSetupForm,
+    TwoFactorVerifyPasswordForm,
     TwoFactorRescueForm,
     VerifyForm,
 )
-from .mail_util import MailUtil
 from .phone_util import PhoneUtil
 from .twofactor import tf_send_security_token
 from .unified_signin import (
@@ -65,20 +67,25 @@ from .utils import (
     default_want_json,
     default_password_validator,
     get_config,
-    get_identity_attribute,
     get_identity_attributes,
     get_message,
+    hash_data,
     localize_callback,
-    set_request_attr,
+    send_mail,
+    string_types,
     uia_email_mapper,
+    uia_phone_mapper,
     url_for_security,
     verify_and_update_password,
+    verify_hash,
 )
 from .views import create_blueprint, default_render_json
+from .cache import VerifyHashCache
 
 # Convenient references
 _security = LocalProxy(lambda: current_app.extensions["security"])
 _datastore = LocalProxy(lambda: _security.datastore)
+local_cache = Local()
 
 # List of authentication mechanisms supported.
 AUTHN_MECHANISMS = ("basic", "session", "token")
@@ -138,6 +145,7 @@ _default_config = {
     "TWO_FACTOR_TOKEN_VALIDATION_URL": "/tf-validate",
     "TWO_FACTOR_QRCODE_URL": "/tf-qrcode",
     "TWO_FACTOR_RESCUE_URL": "/tf-rescue",
+    "TWO_FACTOR_CONFIRM_URL": "/tf-confirm",
     "LOGOUT_METHODS": ["GET", "POST"],
     "POST_LOGIN_VIEW": "/",
     "POST_LOGOUT_VIEW": "/",
@@ -163,6 +171,7 @@ _default_config = {
     "VERIFY_TEMPLATE": "security/verify.html",
     "TWO_FACTOR_VERIFY_CODE_TEMPLATE": "security/two_factor_verify_code.html",
     "TWO_FACTOR_SETUP_TEMPLATE": "security/two_factor_setup.html",
+    "TWO_FACTOR_VERIFY_PASSWORD_TEMPLATE": "security/two_factor_verify_password.html",
     "CONFIRMABLE": False,
     "REGISTERABLE": False,
     "RECOVERABLE": False,
@@ -206,8 +215,10 @@ _default_config = {
     "EMAIL_HTML": True,
     "EMAIL_SUBJECT_TWO_FACTOR": _("Two-factor Login"),
     "EMAIL_SUBJECT_TWO_FACTOR_RESCUE": _("Two-factor Rescue"),
-    "USER_IDENTITY_ATTRIBUTES": [
-        {"email": {"mapper": uia_email_mapper, "case_insensitive": True}}
+    "USER_IDENTITY_ATTRIBUTES": ["email"],
+    "USER_IDENTITY_MAPPINGS": [
+        {"email": uia_email_mapper},
+        {"us_phone_number": uia_phone_mapper},
     ],
     "PHONE_REGION_DEFAULT": "US",
     "FRESHNESS": timedelta(hours=24),
@@ -215,6 +226,9 @@ _default_config = {
     "HASHING_SCHEMES": ["sha256_crypt", "hex_md5"],
     "DEPRECATED_HASHING_SCHEMES": ["hex_md5"],
     "DATETIME_FACTORY": datetime.utcnow,
+    "USE_VERIFY_PASSWORD_CACHE": False,
+    "VERIFY_HASH_CACHE_TTL": 60 * 5,
+    "VERIFY_HASH_CACHE_MAX_SIZE": 500,
     "TOTP_SECRETS": None,
     "TOTP_ISSUER": None,
     "SMS_SERVICE": "Dummy",
@@ -259,6 +273,7 @@ _default_config = {
     "CSRF_COOKIE_REFRESH_EACH_REQUEST": False,
     "BACKWARDS_COMPAT_UNAUTHN": False,
     "BACKWARDS_COMPAT_AUTH_TOKEN": False,
+    "BACKWARDS_COMPAT_AUTH_TOKEN_INVALIDATE": False,
     "JOIN_USER_ROLES": True,
 }
 
@@ -283,13 +298,6 @@ _default_messages = {
     "INVALID_CONFIRMATION_TOKEN": (_("Invalid confirmation token."), "error"),
     "EMAIL_ALREADY_ASSOCIATED": (
         _("%(email)s is already associated with an account."),
-        "error",
-    ),
-    "IDENTITY_ALREADY_ASSOCIATED": (
-        _(
-            "Identity attribute '%(attr)s' with value '%(value)s' is already"
-            " associated with an account."
-        ),
         "error",
     ),
     "PASSWORD_MISMATCH": (_("Password does not match"), "error"),
@@ -380,6 +388,14 @@ _default_messages = {
         _("You successfully changed your two-factor method."),
         "success",
     ),
+    "TWO_FACTOR_PASSWORD_CONFIRMATION_DONE": (
+        _("You successfully confirmed password"),
+        "success",
+    ),
+    "TWO_FACTOR_PASSWORD_CONFIRMATION_NEEDED": (
+        _("Password confirmation is needed in order to access page"),
+        "error",
+    ),
     "TWO_FACTOR_PERMISSION_DENIED": (
         _("You currently do not have permissions to access this page"),
         "error",
@@ -411,6 +427,7 @@ _default_forms = {
     "passwordless_login_form": PasswordlessLoginForm,
     "two_factor_verify_code_form": TwoFactorVerifyCodeForm,
     "two_factor_setup_form": TwoFactorSetupForm,
+    "two_factor_verify_password_form": TwoFactorVerifyPasswordForm,
     "two_factor_rescue_form": TwoFactorRescueForm,
     "us_signin_form": UnifiedSigninForm,
     "us_setup_form": UnifiedSigninSetupForm,
@@ -431,9 +448,12 @@ def _user_loader(user_id):
     This assumes that if the app has fs_uniquifier, it is non-nullable as we specify
     so we use that and only that.
     """
-    user = _security.datastore.find_user(fs_uniquifier=str(user_id))
+    if hasattr(_datastore.user_model, "fs_uniquifier"):
+        selector = dict(fs_uniquifier=str(user_id))
+    else:
+        selector = dict(id=user_id)
+    user = _security.datastore.find_user(**selector)
     if user and user.active:
-        set_request_attr("fs_authn_via", "session")
         return user
     return None
 
@@ -457,32 +477,49 @@ def _request_loader(request):
         if isinstance(data, dict):
             token = data.get(args_key, token)
 
+    use_cache = cv("USE_VERIFY_PASSWORD_CACHE")
+
     try:
         data = _security.remember_token_serializer.loads(
             token, max_age=_security.token_max_age
         )
-        user = _security.datastore.find_user(fs_uniquifier=data[0])
+        user = _security.datastore.find_user(id=data[0])
         if not user.active:
             user = None
     except Exception:
         user = None
 
-    if user and user.verify_auth_token(data):
-        set_request_attr("fs_authn_via", "token")
-        return user
+    if not user:
+        return _security.login_manager.anonymous_user()
+    if use_cache:
+        cache = getattr(local_cache, "verify_hash_cache", None)
+        if cache is None:
+            cache = VerifyHashCache()
+            local_cache.verify_hash_cache = cache
+        if cache.has_verify_hash_cache(user):
+            _request_ctx_stack.top.fs_authn_via = "token"
+            return user
+        if user.verify_auth_token(data):
+            _request_ctx_stack.top.fs_authn_via = "token"
+            cache.set_cache(user)
+            return user
+    else:
+        if user.verify_auth_token(data):
+            _request_ctx_stack.top.fs_authn_via = "token"
+            return user
 
     return _security.login_manager.anonymous_user()
 
 
 def _identity_loader():
     if not isinstance(current_user._get_current_object(), AnonymousUserMixin):
-        identity = Identity(current_user.fs_uniquifier)
+        identity = Identity(current_user.id)
         return identity
 
 
 def _on_identity_loaded(sender, identity):
-    if hasattr(current_user, "fs_uniquifier"):
-        identity.provides.add(UserNeed(current_user.fs_uniquifier))
+    if hasattr(current_user, "id"):
+        identity.provides.add(UserNeed(current_user.id))
 
     for role in getattr(current_user, "roles", []):
         identity.provides.add(RoleNeed(role.name))
@@ -533,7 +570,7 @@ def _get_pwd_context(app):
         schemes=schemes,
         default=pw_hash,
         deprecated=deprecated,
-        **cv("PASSWORD_HASH_PASSLIB_OPTIONS", app=app),
+        **cv("PASSWORD_HASH_PASSLIB_OPTIONS", app=app)
     )
     return cc
 
@@ -574,6 +611,8 @@ def _get_state(app, datastore, anonymous_user=None, **kwargs):
             confirm_serializer=_get_serializer(app, "confirm"),
             us_setup_serializer=_get_serializer(app, "us_setup"),
             _context_processors={},
+            _send_mail_task=None,
+            _send_mail=kwargs.get("send_mail", send_mail),
             _unauthorized_callback=None,
             _render_json=default_render_json,
             _want_json=default_want_json,
@@ -598,7 +637,7 @@ def _context_processor():
     return dict(url_for_security=url_for_security, security=_security)
 
 
-class RoleMixin:
+class RoleMixin(object):
     """Mixin for `Role` model definitions"""
 
     def __eq__(self, other):
@@ -614,8 +653,9 @@ class RoleMixin:
         """
         Return set of permissions associated with role.
 
-        Supports permissions being a comma separated string, an iterable, or a set
-        based on how the underlying DB model was built.
+        Either takes a comma separated string of permissions or
+        an interable of strings if permissions are in their own
+        table.
 
         .. versionadded:: 3.3.0
         """
@@ -627,7 +667,7 @@ class RoleMixin:
             else:
                 # Assume this is a comma separated list
                 return set(self.permissions.split(","))
-        return set()
+        return set([])
 
     def add_permissions(self, permissions):
         """
@@ -635,10 +675,9 @@ class RoleMixin:
 
         :param permissions: a set, list, or single string.
 
-        .. versionadded:: 3.3.0
+        Caller must commit to DB.
 
-        .. deprecated:: 4.0.0
-            Use :meth:`.UserDatastore.add_permissions_to_role`
+        .. versionadded:: 3.3.0
         """
         if hasattr(self, "permissions"):
             current_perms = self.get_permissions()
@@ -649,7 +688,7 @@ class RoleMixin:
             else:
                 perms = {permissions}
             self.permissions = ",".join(current_perms.union(perms))
-        else:  # pragma: no cover
+        else:
             raise NotImplementedError("Role model doesn't have permissions")
 
     def remove_permissions(self, permissions):
@@ -658,10 +697,9 @@ class RoleMixin:
 
         :param permissions: a set, list, or single string.
 
-        .. versionadded:: 3.3.0
+        Caller must commit to DB.
 
-        .. deprecated:: 4.0.0
-            Use :meth:`.UserDatastore.remove_permissions_from_role`
+        .. versionadded:: 3.3.0
         """
         if hasattr(self, "permissions"):
             current_perms = self.get_permissions()
@@ -672,7 +710,7 @@ class RoleMixin:
             else:
                 perms = {permissions}
             self.permissions = ",".join(current_perms.difference(perms))
-        else:  # pragma: no cover
+        else:
             raise NotImplementedError("Role model doesn't have permissions")
 
 
@@ -680,12 +718,22 @@ class UserMixin(BaseUserMixin):
     """Mixin for `User` model definitions"""
 
     def get_id(self):
-        """Returns the user identification attribute. 'Alternative-token' for
-        Flask-Login.
+        """Returns the user identification attribute.
+
+        This will be `fs_uniquifier` if that is available, else base class id
+        (which is via Flask-Login and is user.id).
 
         .. versionadded:: 3.4.0
         """
-        return str(self.fs_uniquifier)
+        if hasattr(self, "fs_uniquifier") and self.fs_uniquifier is not None:
+            # Use fs_uniquifier as alternative_id if available and not None
+            alternative_id = str(self.fs_uniquifier)
+            if len(alternative_id) > 0:
+                # Return only if alternative_id is a valid value
+                return alternative_id
+
+        # Use upstream value if alternative_id is unavailable
+        return BaseUserMixin.get_id(self)
 
     @property
     def is_active(self):
@@ -697,7 +745,9 @@ class UserMixin(BaseUserMixin):
 
         This data MUST be securely signed using the ``remember_token_serializer``
         """
-        data = [str(self.fs_uniquifier)]
+        data = [str(self.id), hash_data(self.password)]
+        if hasattr(self, "fs_uniquifier"):
+            data.append(self.fs_uniquifier)
         return _security.remember_token_serializer.dumps(data)
 
     def verify_auth_token(self, data):
@@ -710,13 +760,23 @@ class UserMixin(BaseUserMixin):
 
         .. versionadded:: 3.3.0
         """
-        return data[0] == self.fs_uniquifier
+        if len(data) > 2 and hasattr(self, "fs_uniquifier"):
+            # has uniquifier - use that
+            if data[2] == self.fs_uniquifier:
+                return True
+            # Don't even try old way - if they have defined a uniquifier
+            # we want that to be able to invalidate tokens if changed.
+            return False
+        # Fall back to old and very expensive check
+        if verify_hash(data[1], self.password):
+            return True
+        return False
 
     def has_role(self, role):
         """Returns `True` if the user identifies with the specified role.
 
         :param role: A role name or `Role` instance"""
-        if isinstance(role, str):
+        if isinstance(role, string_types):
             return role in (role.name for role in self.roles)
         else:
             return role in self.roles
@@ -731,13 +791,14 @@ class UserMixin(BaseUserMixin):
 
         """
         for role in self.roles:
-            if permission in role.get_permissions():
-                return True
+            if hasattr(role, "permissions"):
+                if permission in role.get_permissions():
+                    return True
         return False
 
     def get_security_payload(self):
         """Serialize user object as response payload."""
-        return {}
+        return {"id": str(self.id)}
 
     def get_redirect_qparams(self, existing=None):
         """Return user info that will be added to redirect query params.
@@ -746,15 +807,10 @@ class UserMixin(BaseUserMixin):
         :return: A dict whose keys will be query params and values will be query values.
 
         .. versionadded:: 3.2.0
-
-        .. versionchanged:: 4.0.0
-            Add 'identity' using UserMixin.calc_username() - email is optional.
         """
         if not existing:
             existing = {}
-        if hasattr(self, "email"):
-            existing.update({"email": self.email})
-        existing.update({"identity": self.calc_username()})
+        existing.update({"email": self.email})
         return existing
 
     def verify_and_update_password(self, password):
@@ -838,7 +894,7 @@ class AnonymousUser(AnonymousUserMixin):
         return False
 
 
-class _SecurityState:
+class _SecurityState(object):
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key.lower(), value)
@@ -884,6 +940,9 @@ class _SecurityState:
     def mail_context_processor(self, fn):
         self._add_ctx_processor("mail", fn)
 
+    def tf_verify_password_context_processor(self, fn):
+        self._add_ctx_processor("tf_verify_password", fn)
+
     def tf_setup_context_processor(self, fn):
         self._add_ctx_processor("tf_setup", fn)
 
@@ -898,6 +957,12 @@ class _SecurityState:
 
     def us_verify_context_processor(self, fn):
         self._add_ctx_processor("us_verify", fn)
+
+    def send_mail_task(self, fn):
+        self._send_mail_task = fn
+
+    def send_mail(self, fn):
+        self._send_mail = fn
 
     def unauthorized_handler(self, fn):
         warnings.warn(
@@ -929,7 +994,7 @@ class _SecurityState:
         self._password_validator = cb
 
 
-class Security:
+class Security(object):
     """The :class:`Security` class initializes the Flask-Security extension.
 
     :param app: The application.
@@ -949,6 +1014,7 @@ class Security:
     :param two_factor_setup_form: set form for the 2FA setup view
     :param two_factor_verify_code_form: set form the the 2FA verify code view
     :param two_factor_rescue_form: set form for the 2FA rescue view
+    :param two_factor_verify_password_form: set form for the 2FA verify password view
     :param us_signin_form: set form for the unified sign in view
     :param us_setup_form: set form for the unified sign in setup view
     :param us_setup_validate_form: set form for the unified sign in setup validate view
@@ -956,12 +1022,12 @@ class Security:
     :param anonymous_user: class to use for anonymous user
     :param render_template: function to use to render templates. The default is Flask's
      render_template() function.
+    :param send_mail: function to use to send email. Defaults to :func:`send_mail`
     :param json_encoder_cls: Class to use as blueprint.json_encoder.
      Defaults to :class:`FsJsonEncoder`
     :param totp_cls: Class to use as TOTP factory. Defaults to :class:`Totp`
     :param phone_util_cls: Class to use for phone number utilities.
      Defaults to :class:`PhoneUtil`
-    :param mail_util_cls: Class to use for sending emails. Defaults to :class:`MailUtil`
 
     .. versionadded:: 3.4.0
         ``verify_form`` added as part of freshness/re-authentication
@@ -977,13 +1043,6 @@ class Security:
     .. versionadded:: 3.4.0
         ``phone_util_cls`` added to allow different phone number
          parsing implementations - see :py:class:`PhoneUtil`
-
-    .. versionadded:: 4.0.0
-        ``mail_util_cls`` added to isolate mailing handling
-
-    .. deprecated:: 4.0.0
-        ``send_mail`` and ``send_mail_task``. Replaced with ``mail_util_cls``.
-        ``two_factor_verify_password_form`` removed.
     """
 
     def __init__(self, app=None, datastore=None, register_blueprint=True, **kwargs):
@@ -1026,8 +1085,6 @@ class Security:
             kwargs.setdefault("totp_cls", Totp)
         if "phone_util_cls" not in kwargs:
             kwargs.setdefault("phone_util_cls", PhoneUtil)
-        if "mail_util_cls" not in kwargs:
-            kwargs.setdefault("mail_util_cls", MailUtil)
 
         for key, value in _default_config.items():
             app.config.setdefault("SECURITY_" + key, value)
@@ -1038,10 +1095,6 @@ class Security:
         identity_loaded.connect_via(app)(_on_identity_loaded)
 
         self._state = state = _get_state(app, datastore, **kwargs)
-        if hasattr(datastore, "user_model") and not hasattr(
-            datastore.user_model, "fs_uniquifier"
-        ):  # pragma: no cover
-            raise ValueError("User model must contain fs_uniquifier as of 4.0.0")
 
         if register_blueprint:
             bp = create_blueprint(
@@ -1112,8 +1165,9 @@ class Security:
                 # Add configured header to WTF_CSRF_HEADERS
                 current_app.config["WTF_CSRF_HEADERS"].append(cv("CSRF_HEADER"))
 
-        state._phone_util = state.phone_util_cls(app)
-        state._mail_util = state.mail_util_cls(app)
+        @app.before_first_request
+        def _init_phone_util():
+            state._phone_util = state.phone_util_cls()
 
         app.extensions["security"] = state
 
@@ -1135,33 +1189,12 @@ class Security:
             if not app.config.get(newc, None):
                 app.config[newc] = app.config.get(oldc, None)
 
-        # Check for pre-4.0 SECURITY_USER_IDENTITY_ATTRIBUTES format
-        for uia in cv("USER_IDENTITY_ATTRIBUTES", app=app):  # pragma: no cover
-            if not isinstance(uia, dict):
-                raise ValueError(
-                    "SECURITY_USER_IDENTITY_ATTRIBUTES changed semantics"
-                    " in 4.0 - please see release notes."
-                )
-            if len(list(uia.keys())) != 1:
-                raise ValueError(
-                    "Each element in SECURITY_USER_IDENTITY_ATTRIBUTES"
-                    " must have one and only one key."
-                )
-
         # Two factor configuration checks and setup
         multi_factor = False
         if cv("UNIFIED_SIGNIN", app=app):
             multi_factor = True
             if len(cv("US_ENABLED_METHODS", app=app)) < 1:
                 raise ValueError("Must configure some US_ENABLED_METHODS")
-            if "sms" in cv(
-                "US_ENABLED_METHODS", app=app
-            ) and not get_identity_attribute("us_phone_number", app=app):
-                warnings.warn(
-                    "'sms' was enabled in SECURITY_US_ENABLED_METHODS;"
-                    " however 'us_phone_number' not configured in"
-                    " SECURITY_USER_IDENTITY_ATTRIBUTES"
-                )
         if cv("TWO_FACTOR", app=app):
             multi_factor = True
             if len(cv("TWO_FACTOR_ENABLED_METHODS", app=app)) < 1:
@@ -1191,21 +1224,47 @@ class Security:
                 raise ValueError("Both TOTP_SECRETS and TOTP_ISSUER must be set")
             state.totp_factory(state.totp_cls(secrets, issuer))
 
+        if cv("USE_VERIFY_PASSWORD_CACHE", app=app):
+            self._check_modules("cachetools", "USE_VERIFY_PASSWORD_CACHE")
+
         if cv("PASSWORD_COMPLEXITY_CHECKER", app=app) == "zxcvbn":
             self._check_modules("zxcvbn", "PASSWORD_COMPLEXITY_CHECKER")
         return state
 
     def _check_modules(self, module, config_name):  # pragma: no cover
-        from importlib.util import find_spec
+        PY3 = sys.version_info[0] == 3
+        if PY3:
+            from importlib.util import find_spec
 
-        module_exists = find_spec(module)
+            module_exists = find_spec(module)
+
+        else:
+            import imp
+
+            try:
+                imp.find_module(module)
+                module_exists = True
+            except ImportError:
+                module_exists = False
+
         if not module_exists:
-            raise ValueError(f"{module} is required for {config_name}")
+            raise ValueError("{} is required for {}".format(module, config_name))
 
         return module_exists
 
     def render_template(self, *args, **kwargs):
         return render_template(*args, **kwargs)
+
+    def send_mail(self, fn):
+        """ Function used to send emails.
+
+        :param fn: Function with signature(subject, recipient, template, context)
+
+        See :meth:`send_mail` for details.
+
+        .. versionadded:: 3.1.0
+        """
+        self._state._send_mail = fn
 
     def render_json(self, cb):
         """ Callback to render response payload as JSON.

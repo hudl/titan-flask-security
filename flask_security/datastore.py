@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.datastore
     ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -11,10 +12,10 @@
 import json
 import uuid
 
-from .utils import config_value
+from .utils import config_value, get_identity_attributes, string_types
 
 
-class Datastore:
+class Datastore(object):
     def __init__(self, db):
         self.db = db
 
@@ -114,7 +115,7 @@ class PonyDatastore(Datastore):
         model.delete()
 
 
-class UserDatastore:
+class UserDatastore(object):
     """Abstracted user datastore.
 
     :param user_model: A user model class definition
@@ -131,10 +132,12 @@ class UserDatastore:
         self.user_model = user_model
         self.role_model = role_model
 
-    def _prepare_role_modify_args(self, role):
-        if isinstance(role, str):
+    def _prepare_role_modify_args(self, user, role):
+        if isinstance(user, string_types):
+            user = self.find_user(email=user)
+        if isinstance(role, string_types):
             role = self.find_role(role)
-        return role
+        return user, role
 
     def _prepare_create_user_args(self, **kwargs):
         kwargs.setdefault("active", True)
@@ -144,8 +147,23 @@ class UserDatastore:
             # see if the role exists
             roles[i] = self.find_role(rn)
         kwargs["roles"] = roles
-        kwargs.setdefault("fs_uniquifier", uuid.uuid4().hex)
+        if hasattr(self.user_model, "fs_uniquifier"):
+            kwargs.setdefault("fs_uniquifier", uuid.uuid4().hex)
         return kwargs
+
+    def _is_numeric(self, value):
+        try:
+            int(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _is_uuid(self, value):
+        return isinstance(value, uuid.UUID)
+
+    def get_user(self, id_or_email):
+        """Returns a user matching the specified ID or email address."""
+        raise NotImplementedError
 
     def find_user(self, *args, **kwargs):
         """Returns a user matching the provided parameters."""
@@ -161,9 +179,8 @@ class UserDatastore:
         :param user: The user to manipulate. Can be an User object or email
         :param role: The role to add to the user. Can be a Role object or
             string role name
-        :return: True is role was added, False if role already existed.
         """
-        role = self._prepare_role_modify_args(role)
+        user, role = self._prepare_role_modify_args(user, role)
         if role not in user.roles:
             user.roles.append(role)
             self.put(user)
@@ -176,57 +193,13 @@ class UserDatastore:
         :param user: The user to manipulate. Can be an User object or email
         :param role: The role to remove from the user. Can be a Role object or
             string role name
-        :return: True if role was removed, False if role doesn't exist or user didn't
-            have role.
         """
         rv = False
-        role = self._prepare_role_modify_args(role)
+        user, role = self._prepare_role_modify_args(user, role)
         if role in user.roles:
             rv = True
             user.roles.remove(role)
             self.put(user)
-        return rv
-
-    def add_permissions_to_role(self, role, permissions):
-        """Add one or more permissions to role.
-
-        :param role: The role to modify. Can be a Role object or
-            string role name
-        :param permissions: a set, list, or single string.
-        :return: True if permissions added, False if role doesn't exist.
-
-        Caller must commit to DB.
-
-        .. versionadded:: 4.0.0
-        """
-
-        rv = False
-        role = self._prepare_role_modify_args(role)
-        if role:
-            rv = True
-            role.add_permissions(permissions)
-            self.put(role)
-        return rv
-
-    def remove_permissions_from_role(self, role, permissions):
-        """Remove one or more permissions from a role.
-
-        :param role: The role to modify. Can be a Role object or
-            string role name
-        :param permissions: a set, list, or single string.
-        :return: True if permissions removed, False if role doesn't exist.
-
-        Caller must commit to DB.
-
-        .. versionadded:: 4.0.0
-        """
-
-        rv = False
-        role = self._prepare_role_modify_args(role)
-        if role:
-            rv = True
-            role.remove_permissions(permissions)
-            self.put(role)
         return rv
 
     def toggle_active(self, user):
@@ -262,7 +235,7 @@ class UserDatastore:
         return False
 
     def set_uniquifier(self, user, uniquifier=None):
-        """ Set user's Flask-Security identity key.
+        """ Set user's authentication token uniquifier.
         This will immediately render outstanding auth tokens,
         session cookies and remember cookies invalid.
 
@@ -274,6 +247,8 @@ class UserDatastore:
 
         .. versionadded:: 3.3.0
         """
+        if not hasattr(user, "fs_uniquifier"):
+            return
         if not uniquifier:
             uniquifier = uuid.uuid4().hex
         user.fs_uniquifier = uniquifier
@@ -299,7 +274,7 @@ class UserDatastore:
             perms = kwargs["permissions"]
             if isinstance(perms, list) or isinstance(perms, set):
                 perms = ",".join(perms)
-            elif isinstance(perms, str):
+            elif isinstance(perms, string_types):
                 # squash spaces.
                 perms = ",".join([p.strip() for p in perms.split(",")])
             kwargs["permissions"] = perms
@@ -357,12 +332,12 @@ class UserDatastore:
             * remove all unified signin TOTP secrets so those can't be used
             * remove all two-factor secrets so those can't be used
 
-        Note that if using unified sign in and allow 'email' as a way to receive a code;
+        Note that if using unified sign in and allow 'email' as a way to receive a code
         if the email is compromised - login is still possible. To handle this - it
         is better to deactivate the user.
 
         Note - this method isn't used directly by Flask-Security - it is provided
-        as a helper for an application's administrative needs.
+        as a helper for an applications administrative needs.
 
         Remember to call commit on DB if needed.
 
@@ -477,28 +452,64 @@ class SQLAlchemyUserDatastore(SQLAlchemyDatastore, UserDatastore):
         SQLAlchemyDatastore.__init__(self, db)
         UserDatastore.__init__(self, user_model, role_model)
 
-    def find_user(self, case_insensitive=False, **kwargs):
+    def get_user(self, identifier):
         from sqlalchemy import func as alchemyFn
+        from sqlalchemy import inspect
+        from sqlalchemy.sql import sqltypes
+        from sqlalchemy.dialects.postgresql import UUID as PSQL_UUID
 
+        user_model_query = self.user_model.query
+        if config_value("JOIN_USER_ROLES") and hasattr(self.user_model, "roles"):
+            from sqlalchemy.orm import joinedload
+
+            user_model_query = user_model_query.options(joinedload("roles"))
+
+        # To support both numeric, string, and UUID primary keys, and support
+        # calling this routine with either a numeric value or a string or a UUID
+        # we need to make sure the types basically match.
+        # psycopg2 for example will complain if we attempt to 'get' a
+        # numeric primary key with a string value.
+        # TODO: other datastores don't support this - they assume the only
+        # PK is user.id. That makes things easier but for backwards compat...
+        ins = inspect(self.user_model)
+        pk_type = ins.primary_key[0].type
+        pk_isnumeric = isinstance(pk_type, sqltypes.Integer)
+        pk_isuuid = isinstance(pk_type, PSQL_UUID)
+        # Are they the same or NOT numeric nor UUID
+        if (
+            (pk_isnumeric and self._is_numeric(identifier))
+            or (pk_isuuid and self._is_uuid(identifier))
+            or (not pk_isnumeric and not pk_isuuid)
+        ):
+            rv = self.user_model.query.get(identifier)
+            if rv is not None:
+                return rv
+
+        # Not PK - iterate through other attributes and look for 'identifier'
+        for attr in get_identity_attributes():
+            column = getattr(self.user_model, attr)
+            attr_isnumeric = isinstance(column.type, sqltypes.Integer)
+
+            query = None
+            if attr_isnumeric and self._is_numeric(identifier):
+                query = column == identifier
+            elif not attr_isnumeric and not self._is_numeric(identifier):
+                # Look for exact case-insensitive match - 'ilike' honors
+                # wild cards which isn't what we want.
+                query = alchemyFn.lower(column) == alchemyFn.lower(identifier)
+            if query is not None:
+                rv = user_model_query.filter(query).first()
+                if rv is not None:
+                    return rv
+
+    def find_user(self, **kwargs):
         query = self.user_model.query
         if config_value("JOIN_USER_ROLES") and hasattr(self.user_model, "roles"):
             from sqlalchemy.orm import joinedload
 
             query = query.options(joinedload("roles"))
 
-        if case_insensitive:
-            # While it is of course possible to pass in multiple keys to filter on
-            # that isn't the normal use case. If caller asks for case_insensitive
-            # AND gives multiple keys - throw an error.
-            if len(kwargs) > 1:
-                raise ValueError("Case insensitive option only supports single key")
-            attr, identifier = kwargs.popitem()
-            subquery = alchemyFn.lower(
-                getattr(self.user_model, attr)
-            ) == alchemyFn.lower(identifier)
-            return query.filter(subquery).first()
-        else:
-            return query.filter_by(**kwargs).first()
+        return query.filter_by(**kwargs).first()
 
     def find_role(self, role):
         return self.role_model.query.filter_by(name=role).first()
@@ -510,7 +521,7 @@ class SQLAlchemySessionUserDatastore(SQLAlchemyUserDatastore, SQLAlchemyDatastor
     """
 
     def __init__(self, session, user_model, role_model):
-        class PretendFlaskSQLAlchemyDb:
+        class PretendFlaskSQLAlchemyDb(object):
             """ This is a pretend db object, so we can just pass in a session.
             """
 
@@ -522,7 +533,7 @@ class SQLAlchemySessionUserDatastore(SQLAlchemyUserDatastore, SQLAlchemyDatastor
         )
 
     def commit(self):
-        super().commit()
+        super(SQLAlchemySessionUserDatastore, self).commit()
 
 
 class MongoEngineUserDatastore(MongoEngineDatastore, UserDatastore):
@@ -534,24 +545,39 @@ class MongoEngineUserDatastore(MongoEngineDatastore, UserDatastore):
         MongoEngineDatastore.__init__(self, db)
         UserDatastore.__init__(self, user_model, role_model)
 
-    def find_user(self, case_insensitive=False, **kwargs):
-        from mongoengine.queryset.visitor import Q, QCombination
-        from mongoengine.errors import ValidationError
+    def get_user(self, identifier):
+        from mongoengine import ValidationError
 
         try:
-            if case_insensitive:
-                # While it is of course possible to pass in multiple keys to filter on
-                # that isn't the normal use case. If caller asks for case_insensitive
-                # AND gives multiple keys - throw an error.
-                if len(kwargs) > 1:
-                    raise ValueError("Case insensitive option only supports single key")
-                attr, identifier = kwargs.popitem()
-                query = {f"{attr}__iexact": identifier}
-                return self.user_model.objects(**query).first()
-            else:
-                queries = map(lambda i: Q(**{i[0]: i[1]}), kwargs.items())
-                query = QCombination(QCombination.AND, queries)
-                return self.user_model.objects(query).first()
+            return self.user_model.objects(id=identifier).first()
+        except (ValidationError, ValueError):
+            pass
+
+        is_numeric = self._is_numeric(identifier)
+
+        for attr in get_identity_attributes():
+            query_key = attr if is_numeric else "%s__iexact" % attr
+            query = {query_key: identifier}
+            try:
+                rv = self.user_model.objects(**query).first()
+                if rv is not None:
+                    return rv
+            except (ValidationError, ValueError):
+                # This can happen if identifier is a string but attribute is
+                # an int.
+                pass
+
+    def find_user(self, **kwargs):
+        try:
+            from mongoengine.queryset import Q, QCombination
+        except ImportError:
+            from mongoengine.queryset.visitor import Q, QCombination
+        from mongoengine.errors import ValidationError
+
+        queries = map(lambda i: Q(**{i[0]: i[1]}), kwargs.items())
+        query = QCombination(QCombination.AND, queries)
+        try:
+            return self.user_model.objects(query).first()
         except ValidationError:  # pragma: no cover
             return None
 
@@ -573,23 +599,34 @@ class PeeweeUserDatastore(PeeweeDatastore, UserDatastore):
         UserDatastore.__init__(self, user_model, role_model)
         self.UserRole = role_link
 
-    def find_user(self, case_insensitive=False, **kwargs):
+    def get_user(self, identifier):
         from peewee import fn as peeweeFn
+        from peewee import IntegerField
 
+        # For peewee we only (currently) support numeric primary keys.
+        if self._is_numeric(identifier):
+            try:
+                return self.user_model.get(self.user_model.id == identifier)
+            except (self.user_model.DoesNotExist, ValueError):
+                pass
+
+        for attr in get_identity_attributes():
+            # Read above (SQLAlchemy store) for why we are checking types.
+            column = getattr(self.user_model, attr)
+            attr_isnumeric = isinstance(column, IntegerField)
+            try:
+                if attr_isnumeric and self._is_numeric(identifier):
+                    return self.user_model.get(column == identifier)
+                elif not attr_isnumeric and not self._is_numeric(identifier):
+                    return self.user_model.get(
+                        peeweeFn.Lower(column) == peeweeFn.Lower(identifier)
+                    )
+            except (self.user_model.DoesNotExist, ValueError):
+                pass
+
+    def find_user(self, **kwargs):
         try:
-            if case_insensitive:
-                # While it is of course possible to pass in multiple keys to filter on
-                # that isn't the normal use case. If caller asks for case_insensitive
-                # AND gives multiple keys - throw an error.
-                if len(kwargs) > 1:
-                    raise ValueError("Case insensitive option only supports single key")
-                attr, identifier = kwargs.popitem()
-                return self.user_model.get(
-                    peeweeFn.lower(getattr(self.user_model, attr))
-                    == peeweeFn.lower(identifier)
-                )
-            else:
-                return self.user_model.filter(**kwargs).get()
+            return self.user_model.filter(**kwargs).get()
         except self.user_model.DoesNotExist:
             return None
 
@@ -615,7 +652,7 @@ class PeeweeUserDatastore(PeeweeDatastore, UserDatastore):
         :param user: The user to manipulate
         :param role: The role to add to the user
         """
-        role = self._prepare_role_modify_args(role)
+        user, role = self._prepare_role_modify_args(user, role)
         result = self.UserRole.select().where(
             self.UserRole.user == user.id, self.UserRole.role == role.id
         )
@@ -631,7 +668,7 @@ class PeeweeUserDatastore(PeeweeDatastore, UserDatastore):
         :param user: The user to manipulate
         :param role: The role to remove from the user
         """
-        role = self._prepare_role_modify_args(role)
+        user, role = self._prepare_role_modify_args(user, role)
         result = self.UserRole.select().where(
             self.UserRole.user == user, self.UserRole.role == role
         )
@@ -657,15 +694,26 @@ class PonyUserDatastore(PonyDatastore, UserDatastore):
         UserDatastore.__init__(self, user_model, role_model)
 
     @with_pony_session
-    def find_user(self, case_insensitive=False, **kwargs):
-        if case_insensitive:
-            # While it is of course possible to pass in multiple keys to filter on
-            # that isn't the normal use case. If caller asks for case_insensitive
-            # AND gives multiple keys - throw an error.
-            if len(kwargs) > 1:
-                raise ValueError("Case insensitive option only supports single key")
-            # TODO - implement case insensitive look ups.
+    def get_user(self, identifier):
+        from pony.orm.core import ObjectNotFound
 
+        try:
+            return self.user_model[identifier]
+        except (ObjectNotFound, ValueError):
+            pass
+
+        for attr in get_identity_attributes():
+            # this is a nightmare, tl;dr we need to get the thing that
+            # corresponds to email (usually)
+            try:
+                user = self.user_model.get(**{attr: identifier})
+                if user is not None:
+                    return user
+            except (TypeError, ValueError):
+                pass
+
+    @with_pony_session
+    def find_user(self, **kwargs):
         return self.user_model.get(**kwargs)
 
     @with_pony_session
@@ -674,12 +722,12 @@ class PonyUserDatastore(PonyDatastore, UserDatastore):
 
     @with_pony_session
     def add_role_to_user(self, *args, **kwargs):
-        return super().add_role_to_user(*args, **kwargs)
+        return super(PonyUserDatastore, self).add_role_to_user(*args, **kwargs)
 
     @with_pony_session
     def create_user(self, **kwargs):
-        return super().create_user(**kwargs)
+        return super(PonyUserDatastore, self).create_user(**kwargs)
 
     @with_pony_session
     def create_role(self, **kwargs):
-        return super().create_role(**kwargs)
+        return super(PonyUserDatastore, self).create_role(**kwargs)

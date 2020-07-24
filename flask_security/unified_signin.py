@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.unified_signin
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -15,6 +16,7 @@
     Finish up:
     - we should be able to add a phone number as part of setup even w/o any METHODS -
       i.e. to allow login with any identity (phone) and a password.
+    - add username as last IDENTITY_MAPPING and allow anything...?? or just in example?
 
     Consider/Questions:
     - Allow registering/confirming with just a phone number - this likely would require
@@ -28,10 +30,11 @@
 
 """
 
+import sys
 import time
 
 from flask import current_app as app
-from flask import abort, after_this_request, request, session
+from flask import abort, after_this_request, redirect, request, session
 from flask_login import current_user
 from werkzeug.datastructures import MultiDict
 from werkzeug.local import LocalProxy
@@ -50,8 +53,6 @@ from .utils import (
     check_and_get_token_status,
     config_value,
     do_flash,
-    find_user,
-    get_identity_attributes,
     get_post_login_redirect,
     get_post_verify_redirect,
     get_message,
@@ -60,7 +61,6 @@ from .utils import (
     json_error_response,
     login_user,
     propagate_next,
-    send_mail,
     suppress_form_csrf,
     url_for_security,
 )
@@ -69,16 +69,11 @@ from .utils import (
 _security = LocalProxy(lambda: app.extensions["security"])
 _datastore = LocalProxy(lambda: _security.datastore)
 
-if get_quart_status():  # pragma: no cover
-    from quart import redirect
 
-    async def _commit(response=None):
-        _datastore.commit()
-        return response
-
-
+PY3 = sys.version_info[0] == 3
+if PY3 and get_quart_status():  # pragma: no cover
+    from .async_compat import _commit  # noqa: F401
 else:
-    from flask import redirect
 
     def _commit(response=None):
         _datastore.commit()
@@ -113,14 +108,29 @@ def _us_common_validate(form):
     # Validate identity - we go in order to figure out which user attribute the
     # request gave us. Note that we give up on the first 'match' even if that
     # doesn't yield a user. Why?
-    form.user = find_user(form.identity.data)
-    if not form.user:
-        form.identity.errors.append(get_message("US_SPECIFY_IDENTITY")[0])
-        return False
-    if not form.user.is_active:
-        form.identity.errors.append(get_message("DISABLED_ACCOUNT")[0])
-        return False
-    return True
+    for mapping in config_value("USER_IDENTITY_MAPPINGS"):
+        # What we want is an ordered dict - but those don't exist for py27 -
+        # so there is really just one element here.
+        for ua, mapper in mapping.items():
+            # Make sure we don't validate on a column that application
+            # hasn't specifically configured as a unique/identity column
+            # In other words - might have a phone number for 2FA or unified
+            # but don't want the user to be able to use that as primary identity
+            if ua in config_value("USER_IDENTITY_ATTRIBUTES"):
+                # Allow mapper to alter (coerce) to type DB requires
+                idata = mapper(form.identity.data)
+                if idata is not None:
+                    form.user = _datastore.find_user(**{ua: idata})
+                    if not form.user:
+                        form.identity.errors.append(
+                            get_message("US_SPECIFY_IDENTITY")[0]
+                        )
+                        return False
+                    if not form.user.is_active:
+                        form.identity.errors.append(get_message("DISABLED_ACCOUNT")[0])
+                        return False
+                    return True
+    return False
 
 
 class _UnifiedPassCodeForm(Form):
@@ -144,10 +154,10 @@ class _UnifiedPassCodeForm(Form):
     submit_send_code = SubmitField(get_form_field_label("sendcode"))
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super(_UnifiedPassCodeForm, self).__init__(*args, **kwargs)
 
     def validate(self):
-        if not super().validate():
+        if not super(_UnifiedPassCodeForm, self).validate():
             return False
         if not self.user:
             # This is sign-in case.
@@ -222,12 +232,12 @@ class UnifiedSigninForm(_UnifiedPassCodeForm):
     remember = BooleanField(get_form_field_label("remember_me"))
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super(UnifiedSigninForm, self).__init__(*args, **kwargs)
         self.remember.default = config_value("DEFAULT_REMEMBER_ME")
 
     def validate(self):
         self.user = None
-        if not super().validate():
+        if not super(UnifiedSigninForm, self).validate():
             return False
 
         if self.submit.data:
@@ -248,7 +258,7 @@ class UnifiedVerifyForm(_UnifiedPassCodeForm):
 
     def validate(self):
         self.user = current_user
-        if not super().validate():
+        if not super(UnifiedVerifyForm, self).validate():
             return False
         return True
 
@@ -271,10 +281,10 @@ class UnifiedSigninSetupForm(Form):
     submit = SubmitField(get_form_field_label("submit"))
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super(UnifiedSigninSetupForm, self).__init__(*args, **kwargs)
 
     def validate(self):
-        if not super().validate():
+        if not super(UnifiedSigninSetupForm, self).validate():
             return False
         if self.chosen_method.data not in config_value("US_ENABLED_METHODS"):
             self.chosen_method.errors.append(get_message("US_METHOD_NOT_AVAILABLE")[0])
@@ -300,10 +310,10 @@ class UnifiedSigninSetupValidateForm(Form):
     submit = SubmitField(get_form_field_label("submitcode"))
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super(UnifiedSigninSetupValidateForm, self).__init__(*args, **kwargs)
 
     def validate(self):
-        if not super().validate():
+        if not super(UnifiedSigninSetupValidateForm, self).validate():
             return False
 
         if not _security._totp_factory.verify_totp(
@@ -390,7 +400,7 @@ def us_signin_send_code():
         payload = {
             "available_methods": config_value("US_ENABLED_METHODS"),
             "code_methods": code_methods,
-            "identity_attributes": get_identity_attributes(),
+            "identity_attributes": config_value("USER_IDENTITY_ATTRIBUTES"),
         }
         return base_render_json(form, include_user=False, additional=payload)
 
@@ -536,7 +546,7 @@ def us_signin():
         payload = {
             "available_methods": config_value("US_ENABLED_METHODS"),
             "code_methods": code_methods,
-            "identity_attributes": get_identity_attributes(),
+            "identity_attributes": config_value("USER_IDENTITY_ATTRIBUTES"),
         }
         return base_render_json(form, include_user=False, additional=payload)
 
@@ -770,7 +780,7 @@ def us_setup():
     # Or failure of POST
     if _security._want_json(request):
         payload = {
-            "identity_attributes": get_identity_attributes(),
+            "identity_attributes": config_value("USER_IDENTITY_ATTRIBUTES"),
             "available_methods": config_value("US_ENABLED_METHODS"),
             "active_methods": active_methods,
             "setup_methods": setup_methods,
@@ -922,7 +932,7 @@ def us_send_security_token(
             login_link = url_for_security(
                 "us_verify_link", email=user.email, code=token, _external=True
             )
-        send_mail(
+        _security._send_mail(
             config_value("US_EMAIL_SUBJECT"),
             user.email,
             "us_instructions",

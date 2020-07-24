@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.utils
     ~~~~~~~~~~~~~~~~~~~~
@@ -14,20 +15,20 @@ import datetime
 from functools import partial
 import hashlib
 import hmac
+import sys
 import time
-from typing import Dict, List
 import warnings
+from contextlib import contextmanager
 from datetime import timedelta
-from urllib.parse import parse_qsl, parse_qs, urlsplit, urlunsplit, urlencode
-import urllib.request
-import urllib.error
 
 from flask import _request_ctx_stack, current_app, flash, g, request, session, url_for
 from flask.json import JSONEncoder
+from flask.signals import message_flashed
 from flask_login import login_user as _login_user
 from flask_login import logout_user as _logout_user
 from flask_login import current_user
 from flask_login import COOKIE_NAME as REMEMBER_COOKIE_NAME
+from flask_mail import Message
 from flask_principal import AnonymousIdentity, Identity, identity_changed, Need
 from flask_wtf import csrf
 from wtforms import validators, ValidationError
@@ -36,7 +37,18 @@ from speaklater import is_lazy_string
 from werkzeug.local import LocalProxy
 from werkzeug.datastructures import MultiDict
 from .quart_compat import best
-from .signals import user_authenticated
+from .signals import (
+    login_instructions_sent,
+    reset_password_instructions_sent,
+    user_authenticated,
+    user_registered,
+)
+
+try:  # pragma: no cover
+    from urlparse import parse_qsl, parse_qs, urlsplit, urlunsplit
+    from urllib import urlencode
+except ImportError:  # pragma: no cover
+    from urllib.parse import parse_qsl, parse_qs, urlsplit, urlunsplit, urlencode
 
 # Convenient references
 _security = LocalProxy(lambda: current_app.extensions["security"])
@@ -49,6 +61,15 @@ _hashing_context = LocalProxy(lambda: _security.hashing_context)
 
 localize_callback = LocalProxy(lambda: _security.i18n_domain.gettext)
 
+PY3 = sys.version_info[0] == 3
+
+if PY3:  # pragma: no cover
+    string_types = (str,)  # noqa
+    text_type = str  # noqa
+else:  # pragma: no cover
+    string_types = (basestring,)  # noqa
+    text_type = unicode  # noqa
+
 FsPermNeed = partial(Need, "fsperm")
 FsPermNeed.__doc__ = """A need with the method preset to `"fsperm"`."""
 
@@ -56,26 +77,6 @@ FsPermNeed.__doc__ = """A need with the method preset to `"fsperm"`."""
 def _(translate):
     """Identity function to mark strings for translation."""
     return translate
-
-
-def get_request_attr(name):
-    """ Retrieve a request local attribute.
-
-    Currently public attributes are:
-
-    **fs_authn_via**
-        will be set to the authentication mechanism (session, token, basic)
-        that the current request was authenticated with.
-
-    Returns None if attribute doesn't exist.
-
-    .. versionadded:: 4.0.0
-    """
-    return getattr(_request_ctx_stack.top, name, None)
-
-
-def set_request_attr(name, value):
-    return setattr(_request_ctx_stack.top, name, value)
 
 
 def find_csrf_field_name():
@@ -132,9 +133,7 @@ def login_user(user, remember=None, authn_via=None):
     session["fs_cc"] = "set"  # CSRF cookie
     session["fs_paa"] = time.time()  # Primary authentication at - timestamp
 
-    identity_changed.send(
-        current_app._get_current_object(), identity=Identity(user.fs_uniquifier)
-    )
+    identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
 
     user_authenticated.send(
         current_app._get_current_object(), user=user, authn_via=authn_via
@@ -170,7 +169,11 @@ def logout_user():
     _logout_user()
 
 
-def check_and_update_authn_fresh(within, grace, method=None):
+def _py2timestamp(dt):
+    return time.mktime(dt.timetuple()) + dt.microsecond / 1e6
+
+
+def check_and_update_authn_fresh(within, grace):
     """ Check if user authenticated within specified time and update grace period.
 
     :param within: A timedelta specifying the maximum time in the past that the caller
@@ -179,8 +182,6 @@ def check_and_update_authn_fresh(within, grace, method=None):
                   will set a grace period for which freshness won't be checked.
                   The intent here is that the caller shouldn't get part-way though
                   a set of operations and suddenly be required to authenticate again.
-    :param method: Optional - if set and == "basic" then will always return True.
-                  (since basic-auth sends username/password on every request)
 
     If within.total_seconds() is negative, will always return True (always 'fresh').
     This effectively just disables this entire mechanism.
@@ -192,20 +193,13 @@ def check_and_update_authn_fresh(within, grace, method=None):
     return False (not fresh).
 
     Be aware that for this to work, sessions and therefore session cookies
-    must be functioning and being sent as part of the request. If the required
-    state isn't in the session cookie then return False (not 'fresh').
+    must be functioning and being sent as part of the request.
 
     .. warning::
         Be sure the caller is already authenticated PRIOR to calling this method.
 
     .. versionadded:: 3.4.0
-
-    .. versionchanged:: 4.0.0
-        Added `method` parameter.
     """
-
-    if method == "basic":
-        return True
 
     if within.total_seconds() < 0:
         # this means 'always fresh'
@@ -217,11 +211,13 @@ def check_and_update_authn_fresh(within, grace, method=None):
 
     now = datetime.datetime.utcnow()
     new_exp = now + grace
-    grace_ts = int(new_exp.timestamp())
+    # grace_ts = int(new_exp.timestamp())
+    grace_ts = int(_py2timestamp(new_exp))
 
     fs_gexp = session.get("fs_gexp", None)
     if fs_gexp:
-        if now.timestamp() < fs_gexp:
+        # if now.timestamp() < fs_gexp:
+        if _py2timestamp(now) < fs_gexp:
             # Within grace period - extend it and we're good.
             session["fs_gexp"] = grace_ts
             return True
@@ -344,7 +340,7 @@ def hash_password(password):
         password,
         **config_value("PASSWORD_HASH_OPTIONS", default={}).get(
             _security.password_hash, {}
-        ),
+        )
     )
 
 
@@ -353,7 +349,7 @@ def encode_string(string):
 
     :param string: The string to encode"""
 
-    if isinstance(string, str):
+    if isinstance(string, text_type):
         string = string.encode("utf-8")
     return string
 
@@ -373,7 +369,8 @@ def suppress_form_csrf():
     If app doesn't want CSRF for unauth endpoints then check if caller is authenticated
     or not (many endpoints can be called either way).
     """
-    if get_request_attr("fs_ignore_csrf"):
+    ctx = _request_ctx_stack.top
+    if hasattr(ctx, "fs_ignore_csrf") and ctx.fs_ignore_csrf:
         # This is the case where CsrfProtect was already called (e.g. @auth_required)
         return {"csrf": False}
     if (
@@ -449,7 +446,7 @@ def transform_url(url, qparams=None, **kwargs):
 
 
 def get_security_endpoint_name(endpoint):
-    return f"{_security.blueprint_name}.{endpoint}"
+    return "%s.%s" % (_security.blueprint_name, endpoint)
 
 
 def url_for_security(endpoint, **values):
@@ -538,7 +535,7 @@ def get_config(app):
     prefix = "SECURITY_"
 
     def strip_prefix(tup):
-        return tup[0].replace("SECURITY_", ""), tup[1]
+        return (tup[0].replace("SECURITY_", ""), tup[1])
 
     return dict([strip_prefix(i) for i in items if i[0].startswith(prefix)])
 
@@ -557,11 +554,7 @@ def config_value(key, app=None, default=None):
     :param default: An optional default value if the value is not set
     """
     app = app or current_app
-    # protect against spelling mistakes
-    config = get_config(app)
-    if key.upper() not in config:
-        raise ValueError(f"Key {key} doesn't exist")
-    return config.get(key.upper(), default)
+    return get_config(app).get(key.upper(), default)
 
 
 def get_max_age(key, app=None):
@@ -590,7 +583,7 @@ def get_within_delta(key, app=None):
 
 
 def send_mail(subject, recipient, template, **context):
-    """Send an email.
+    """Send an email via the Flask-Mail extension.
 
     :param subject: Email subject
     :param recipient: Email recipient
@@ -601,21 +594,24 @@ def send_mail(subject, recipient, template, **context):
     context.setdefault("security", _security)
     context.update(_security._run_ctx_processor("mail"))
 
-    body = None
-    html = None
-    ctx = ("security/email", template)
-    if config_value("EMAIL_PLAINTEXT"):
-        body = _security.render_template("%s/%s.txt" % ctx, **context)
-    if config_value("EMAIL_HTML"):
-        html = _security.render_template("%s/%s.html" % ctx, **context)
-
     sender = _security.email_sender
     if isinstance(sender, LocalProxy):
         sender = sender._get_current_object()
 
-    _security._mail_util.send_mail(
-        template, subject, recipient, str(sender), body, html, context.get("user", None)
-    )
+    msg = Message(subject, sender=sender, recipients=[recipient])
+
+    ctx = ("security/email", template)
+    if config_value("EMAIL_PLAINTEXT"):
+        msg.body = _security.render_template("%s/%s.txt" % ctx, **context)
+    if config_value("EMAIL_HTML"):
+        msg.html = _security.render_template("%s/%s.html" % ctx, **context)
+
+    if _security._send_mail_task:
+        _security._send_mail_task(msg)
+        return
+
+    mail = current_app.extensions.get("mail")
+    mail.send(msg)
 
 
 def get_token_status(token, serializer, max_age=None, return_data=False):
@@ -642,7 +638,7 @@ def get_token_status(token, serializer, max_age=None, return_data=False):
         invalid = True
 
     if data:
-        user = _datastore.find_user(fs_uniquifier=data[0])
+        user = _datastore.find_user(id=data[0])
 
     expired = expired and (user is not None)
 
@@ -680,55 +676,21 @@ def check_and_get_token_status(token, serializer, within=None):
     return expired, invalid, data
 
 
-def get_identity_attributes(app=None) -> List:
-    # Return list of keys of identity attributes
-    # Is it possible to not have any?
+def get_identity_attributes(app=None):
     app = app or current_app
-    iattrs = app.config["SECURITY_USER_IDENTITY_ATTRIBUTES"]
-    if iattrs:
-        return [[*f][0] for f in iattrs]
-    return []
-
-
-def get_identity_attribute(attr, app=None) -> Dict:
-    """ Given an user_identity_attribute, return the defining dict.
-    A bit annoying since USER_IDENTITY_ATTRIBUTES is a list of dict
-    where each dict has just one key.
-    """
-    app = app or current_app
-    iattrs = app.config["SECURITY_USER_IDENTITY_ATTRIBUTES"]
-    if iattrs:
-        details = [
-            mapping[attr] for mapping in iattrs if list(mapping.keys())[0] == attr
-        ]
-        if details:
-            return details[0]
-    return {}
-
-
-def find_user(identity):
-    """
-    Validate identity - we go in order to figure out which user attribute the
-    request gave us. Note that we give up on the first 'match' even if that
-    doesn't yield a user. Why?
-    """
-    for mapping in config_value("USER_IDENTITY_ATTRIBUTES"):
-        attr = list(mapping.keys())[0]
-        details = mapping[attr]
-        idata = details["mapper"](identity)
-        if idata:
-            user = _datastore.find_user(
-                case_insensitive=details.get("case_insensitive", False), **{attr: idata}
-            )
-            return user
-    return None
+    attrs = app.config["SECURITY_USER_IDENTITY_ATTRIBUTES"]
+    try:
+        attrs = [f.strip() for f in attrs.split(",")]
+    except AttributeError:
+        pass
+    return attrs
 
 
 def uia_phone_mapper(identity):
     """ Used to match identity as a phone number. This is a simple proxy
     to :py:class:`PhoneUtil`
 
-    See :py:data:`SECURITY_USER_IDENTITY_ATTRIBUTES`.
+    See :py:data:`SECURITY_USER_IDENTITY_MAPPINGS`.
 
     .. versionadded:: 3.4.0
     """
@@ -739,18 +701,18 @@ def uia_phone_mapper(identity):
 def uia_email_mapper(identity):
     """ Used to match identity as an email.
 
-    See :py:data:`SECURITY_USER_IDENTITY_ATTRIBUTES`.
+    See :py:data:`SECURITY_USER_IDENTITY_MAPPINGS`.
 
     .. versionadded:: 3.4.0
     """
 
     # Fake up enough to invoke the WTforms email validator.
-    class FakeField:
+    class FakeField(object):
         pass
 
     email_validator = validators.Email(message="nothing")
     field = FakeField()
-    field.data = identity
+    setattr(field, "data", identity)
     try:
         email_validator(None, field)
     except ValidationError:
@@ -895,7 +857,7 @@ def default_want_json(req):
     if not hasattr(req.accept_mimetypes, "best"):  # pragma: no cover
         # Alright. we dont have the best property, lets add it ourselves.
         # This is for quart compatibility
-        accept_mimetypes.best = best
+        setattr(accept_mimetypes, "best", best)
     if accept_mimetypes.best == "application/json":
         return True
     return False
@@ -904,7 +866,14 @@ def default_want_json(req):
 def json_error_response(errors):
     """ Helper to create an error response that adheres to the openapi spec.
     """
-    if isinstance(errors, str):
+    # Python 2 and 3 compatibility for checking if something is a string.
+    try:  # pragma: no cover
+        basestring
+        string_type_check = (basestring, unicode)
+    except NameError:  # pragma: no cover
+        string_type_check = str
+
+    if isinstance(errors, string_type_check):
         # When the errors is a string, use the response/error/message format
         response_json = dict(error=errors)
     elif isinstance(errors, dict):
@@ -931,7 +900,77 @@ class FsJsonEncoder(JSONEncoder):
             return JSONEncoder.default(self, obj)
 
 
-class SmsSenderBaseClass(metaclass=abc.ABCMeta):
+@contextmanager
+def capture_passwordless_login_requests():
+    login_requests = []
+
+    def _on(app, **data):
+        login_requests.append(data)
+
+    login_instructions_sent.connect(_on)
+
+    try:
+        yield login_requests
+    finally:
+        login_instructions_sent.disconnect(_on)
+
+
+@contextmanager
+def capture_registrations():
+    """Testing utility for capturing registrations.
+    """
+    registrations = []
+
+    def _on(app, **data):
+        registrations.append(data)
+
+    user_registered.connect(_on)
+
+    try:
+        yield registrations
+    finally:
+        user_registered.disconnect(_on)
+
+
+@contextmanager
+def capture_reset_password_requests(reset_password_sent_at=None):
+    """Testing utility for capturing password reset requests.
+
+    :param reset_password_sent_at: An optional datetime object to set the
+                                   user's `reset_password_sent_at` to
+    """
+    reset_requests = []
+
+    def _on(app, **data):
+        reset_requests.append(data)
+
+    reset_password_instructions_sent.connect(_on)
+
+    try:
+        yield reset_requests
+    finally:
+        reset_password_instructions_sent.disconnect(_on)
+
+
+@contextmanager
+def capture_flashes():
+    """Testing utility for capturing flashes."""
+    flashes = []
+
+    def _on(app, **data):
+        flashes.append(data)
+
+    message_flashed.connect(_on)
+
+    try:
+        yield flashes
+    finally:
+        message_flashed.disconnect(_on)
+
+
+class SmsSenderBaseClass(object):
+    __metaclass__ = abc.ABCMeta
+
     def __init__(self):
         pass
 
@@ -950,7 +989,7 @@ class DummySmsSender(SmsSenderBaseClass):
         return
 
 
-class SmsSenderFactory:
+class SmsSenderFactory(object):
     senders = {"Dummy": DummySmsSender}
 
     @classmethod
@@ -1096,6 +1135,8 @@ def pwned(password):
     :return: Count of password in DB (0 means hasn't been compromised)
      Can raise HTTPError
 
+    Only implemented for python 3
+
     .. versionadded:: 3.4.0
     """
 
@@ -1105,15 +1146,21 @@ def pwned(password):
 
     sha1 = hashlib.sha1(password.encode("utf8")).hexdigest()
 
-    req = urllib.request.Request(
-        url="https://api.pwnedpasswords.com/range/{}".format(sha1[:5].upper()),
-        headers={"User-Agent": "Flask-Security (Python)"},
-    )
-    # Might raise HTTPError
-    with urllib.request.urlopen(req) as f:
-        response = f.read()
+    if PY3:
+        import urllib.request
+        import urllib.error
 
-    raw = response.decode("utf-8-sig")
+        req = urllib.request.Request(
+            url="https://api.pwnedpasswords.com/range/{}".format(sha1[:5].upper()),
+            headers={"User-Agent": "Flask-Security (Python)"},
+        )
+        # Might raise HTTPError
+        with urllib.request.urlopen(req) as f:
+            response = f.read()
 
-    entries = dict(map(convert_password_tuple, raw.upper().split("\r\n")))
-    return entries.get(sha1[5:].upper(), 0)
+        raw = response.decode("utf-8-sig")
+
+        entries = dict(map(convert_password_tuple, raw.upper().split("\r\n")))
+        return entries.get(sha1[5:].upper(), 0)
+
+    raise NotImplementedError()

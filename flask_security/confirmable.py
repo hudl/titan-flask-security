@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.confirmable
     ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -17,7 +18,6 @@ from .utils import (
     config_value,
     get_token_status,
     hash_data,
-    send_mail,
     url_for_security,
     verify_hash,
 )
@@ -41,7 +41,7 @@ def send_confirmation_instructions(user):
 
     confirmation_link, token = generate_confirmation_link(user)
 
-    send_mail(
+    _security._send_mail(
         config_value("EMAIL_SUBJECT_CONFIRM"),
         user.email,
         "confirmation_instructions",
@@ -57,7 +57,7 @@ def generate_confirmation_token(user):
 
     :param user: The user to work with
     """
-    data = [str(user.fs_uniquifier), hash_data(user.email)]
+    data = [str(user.id), hash_data(user.email)]
     return _security.confirm_serializer.dumps(data)
 
 

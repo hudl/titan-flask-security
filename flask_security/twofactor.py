@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.two_factor
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -19,7 +20,6 @@ from .utils import (
     do_flash,
     login_user,
     json_error_response,
-    send_mail,
     url_for_security,
 )
 from .signals import (
@@ -43,6 +43,7 @@ def tf_clean_session():
             "tf_state",
             "tf_user_id",
             "tf_primary_method",
+            "tf_confirmed",
             "tf_remember_login",
             "tf_totp_secret",
         ]:
@@ -66,7 +67,7 @@ def tf_send_security_token(user, method, totp_secret, phone_number):
     """
     token_to_be_sent = _security._totp_factory.generate_totp_password(totp_secret)
     if method == "email" or method == "mail":
-        send_mail(
+        _security._send_mail(
             config_value("EMAIL_SUBJECT_TWO_FACTOR"),
             user.email,
             "two_factor_instructions",
@@ -147,7 +148,7 @@ def tf_login(user, remember=None, primary_authn_via=None):
     # until complete 2FA.
     tf_clean_session()
 
-    session["tf_user_id"] = user.fs_uniquifier
+    session["tf_user_id"] = user.id
     if "remember":
         session["tf_remember_login"] = remember
 

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security
     ~~~~~~~~~~~~~~
@@ -46,10 +47,9 @@ from .forms import (
     TwoFactorRescueForm,
     TwoFactorSetupForm,
     TwoFactorVerifyCodeForm,
+    TwoFactorVerifyPasswordForm,
     VerifyForm,
-    unique_identity_attribute,
 )
-from .mail_util import MailUtil
 from .phone_util import PhoneUtil
 from .signals import (
     confirm_instructions_sent,
@@ -82,7 +82,6 @@ from .utils import (
     SmsSenderFactory,
     check_and_get_token_status,
     get_hmac,
-    get_request_attr,
     get_token_status,
     get_url,
     hash_password,
@@ -102,4 +101,4 @@ from .utils import (
     verify_and_update_password,
 )
 
-__version__ = "4.0.0.dev1"
+__version__ = "3.4.3"

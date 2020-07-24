@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
     flask_security.views
     ~~~~~~~~~~~~~~~~~~~~
@@ -30,6 +31,7 @@
     authenticated (via session?) as well as unauthenticated access.
 """
 
+import sys
 import time
 
 from flask import (
@@ -78,7 +80,6 @@ from .twofactor import (
 )
 from .utils import (
     base_render_json,
-    check_and_update_authn_fresh,
     config_value,
     do_flash,
     get_message,
@@ -86,12 +87,10 @@ from .utils import (
     get_post_logout_redirect,
     get_post_register_redirect,
     get_post_verify_redirect,
-    get_request_attr,
     get_url,
     json_error_response,
     login_user,
     logout_user,
-    send_mail,
     slash_url_suffix,
     suppress_form_csrf,
     url_for_security,
@@ -99,19 +98,8 @@ from .utils import (
 
 if get_quart_status():  # pragma: no cover
     from quart import make_response, redirect
-
-    async def _commit(response=None):
-        _datastore.commit()
-        return response
-
-
 else:
     from flask import make_response, redirect
-
-    def _commit(response=None):
-        _datastore.commit()
-        return response
-
 
 # Convenient references
 _security = LocalProxy(lambda: current_app.extensions["security"])
@@ -127,6 +115,16 @@ def default_render_json(payload, code, headers, user):
     headers["Content-Type"] = "application/json"
     payload = dict(meta=dict(code=code), response=payload)
     return make_response(jsonify(payload), code, headers)
+
+
+PY3 = sys.version_info[0] == 3
+if PY3 and get_quart_status():  # pragma: no cover
+    from .async_compat import _commit  # noqa: F401
+else:
+
+    def _commit(response=None):
+        _datastore.commit()
+        return response
 
 
 def _ctx(endpoint):
@@ -592,8 +590,8 @@ def reset_password(token):
             return tf_login(user, primary_authn_via="reset")
         login_user(user, authn_via=["reset"])
         if _security._want_json(request):
-            login_form = _security.login_form()
-            login_form.user = user
+            login_form = _security.login_form(MultiDict({"email": user.email}))
+            setattr(login_form, "user", user)
             return base_render_json(login_form, include_auth_token=True)
         else:
             do_flash(*get_message("PASSWORD_RESET"))
@@ -658,7 +656,8 @@ def two_factor_setup():
     3) user wanting to enable or disable 2FA (assuming application doesn't require it)
 
     In order to CHANGE/ENABLE/DISABLE a 2FA information, user must be properly logged in
-    AND have a 'fresh' authentication.
+    AND must perform a fresh password validation by
+    calling POST /tf-confirm (which sets 'tf_confirmed' in the session).
 
     For initial login when 2FA required of course user can't be logged in - in this
     case we need to have been sent some
@@ -668,16 +667,13 @@ def two_factor_setup():
     form_class = _security.two_factor_setup_form
 
     if request.is_json:
-        if request.content_length:
-            form = form_class(MultiDict(request.get_json()), meta=suppress_form_csrf())
-        else:
-            form = form_class(formdata=None, meta=suppress_form_csrf())
+        form = form_class(MultiDict(request.get_json()), meta=suppress_form_csrf())
     else:
         form = form_class(meta=suppress_form_csrf())
 
     if not current_user.is_authenticated:
         # This is the initial login case
-        # We can also get here from setup if they want to change TODO: how?
+        # We can also get here from setup if they want to change
         if not all(k in session for k in ["tf_user_id", "tf_state"]) or session[
             "tf_state"
         ] not in ["setup_from_login", "validating_profile"]:
@@ -685,21 +681,18 @@ def two_factor_setup():
             tf_clean_session()
             return _tf_illegal_state(form, _security.login_url)
 
-        user = _datastore.find_user(fs_uniquifier=session["tf_user_id"])
+        user = _datastore.get_user(session["tf_user_id"])
         if not user:
             tf_clean_session()
             return _tf_illegal_state(form, _security.login_url)
 
     else:
-        # Caller is changing their TFA profile. This requires a 'fresh' authentication
-        if not check_and_update_authn_fresh(
-            config_value("FRESHNESS"),
-            config_value("FRESHNESS_GRACE_PERIOD"),
-            get_request_attr("fs_authn_via"),
-        ):
-            return _security._reauthn_handler(
-                config_value("FRESHNESS"), config_value("FRESHNESS_GRACE_PERIOD")
-            )
+        # all other cases require user to be logged in and have performed
+        # additional password verification as signified by 'tf_confirmed'
+        # in the session.
+        if "tf_confirmed" not in session:
+            tf_clean_session()
+            return _tf_illegal_state(form, _security.two_factor_confirm_url)
         user = current_user
 
     if form.validate_on_submit():
@@ -764,7 +757,7 @@ def two_factor_setup():
 
     # We get here on GET and POST with failed validation.
     # For things like phone number - we've already done one POST
-    # that succeeded and now it failed - so retain the initial info
+    # that succeeded and now if failed - so retain the initial info
     if _security._want_json(request):
         return base_render_json(form, include_user=False)
 
@@ -793,6 +786,7 @@ def two_factor_token_validation():
        In this case - user not logged in -
        but 'tf_state' == 'ready' or 'validating_profile'
     2) validating after CHANGE/ENABLE 2FA. In this case user logged in/authenticated
+       they must have 'tf_confirmed' set meaning they re-entered their passwd
 
     """
 
@@ -805,22 +799,20 @@ def two_factor_token_validation():
 
     changing = current_user.is_authenticated
     if not changing:
-        # This is the normal login case OR initial setup
+        # This is the normal login case
         if (
             not all(k in session for k in ["tf_user_id", "tf_state"])
             or session["tf_state"] not in ["ready", "validating_profile"]
             or (
                 session["tf_state"] == "validating_profile"
-                and not all(
-                    k in session for k in ["tf_primary_method", "tf_totp_secret"]
-                )
+                and "tf_primary_method" not in session
             )
         ):
             # illegal call on this endpoint
             tf_clean_session()
             return _tf_illegal_state(form, _security.login_url)
 
-        user = _datastore.find_user(fs_uniquifier=session["tf_user_id"])
+        user = _datastore.get_user(session["tf_user_id"])
         form.user = user
         if not user:
             tf_clean_session()
@@ -833,9 +825,10 @@ def two_factor_token_validation():
             pm = session["tf_primary_method"]
             totp_secret = session["tf_totp_secret"]
     else:
-        # Changing TFA profile - user is already authenticated.
         if (
-            not all(k in session for k in ["tf_state", "tf_primary_method"])
+            not all(
+                k in session for k in ["tf_confirmed", "tf_state", "tf_primary_method"]
+            )
             or session["tf_state"] != "validating_profile"
         ):
             tf_clean_session()
@@ -846,8 +839,8 @@ def two_factor_token_validation():
         totp_secret = session["tf_totp_secret"]
         form.user = current_user
 
-    form.primary_method = pm
-    form.tf_totp_secret = totp_secret
+    setattr(form, "primary_method", pm)
+    setattr(form, "tf_totp_secret", totp_secret)
     if form.validate_on_submit():
         # Success - log in user and clear all session variables
         completion_message = complete_two_factor_process(
@@ -912,7 +905,7 @@ def two_factor_rescue():
         tf_clean_session()
         return _tf_illegal_state(form, _security.login_url)
 
-    user = _datastore.find_user(fs_uniquifier=session["tf_user_id"])
+    user = _datastore.get_user(session["tf_user_id"])
     form.user = user
     if not user:
         tf_clean_session()
@@ -939,7 +932,7 @@ def two_factor_rescue():
                     )
         # send app provider a mail message regarding trouble
         elif problem == "no_mail_access":
-            send_mail(
+            _security._send_mail(
                 config_value("EMAIL_SUBJECT_TWO_FACTOR_RESCUE"),
                 config_value("TWO_FACTOR_RESCUE_MAIL"),
                 "two_factor_rescue",
@@ -962,6 +955,39 @@ def two_factor_rescue():
     )
 
 
+@auth_required("basic", "session", "token")
+def two_factor_verify_password():
+    """View function which handles a password verification request."""
+    form_class = _security.two_factor_verify_password_form
+
+    if request.is_json:
+        form = form_class(MultiDict(request.get_json()), meta=suppress_form_csrf())
+    else:
+        form = form_class(meta=suppress_form_csrf())
+
+    if form.validate_on_submit():
+        # form called verify_and_update_password()
+        after_this_request(_commit)
+        session["tf_confirmed"] = True
+        m, c = get_message("TWO_FACTOR_PASSWORD_CONFIRMATION_DONE")
+        if not _security._want_json(request):
+            do_flash(m, c)
+            return redirect(url_for_security("two_factor_setup"))
+        else:
+            return _security._render_json(json_error_response(m), 400, None, None)
+
+    if _security._want_json(request):
+        assert form.user == current_user
+        # form.user = current_user
+        return base_render_json(form)
+
+    return _security.render_template(
+        config_value("TWO_FACTOR_VERIFY_PASSWORD_TEMPLATE"),
+        two_factor_verify_password_form=form,
+        **_ctx("tf_verify_password")
+    )
+
+
 @unauth_csrf(fall_through=True)
 def two_factor_qrcode():
     if current_user.is_authenticated:
@@ -969,7 +995,7 @@ def two_factor_qrcode():
     else:
         if "tf_user_id" not in session:
             abort(404)
-        user = _datastore.find_user(fs_uniquifier=session["tf_user_id"])
+        user = _datastore.get_user(session["tf_user_id"])
         if not user:
             # Seems like we should be careful here if user_id is gone.
             tf_clean_session()
@@ -997,7 +1023,7 @@ def two_factor_qrcode():
                 username if username else "Unknown", totp
             )
         )
-    except ImportError:  # pragma: no cover
+    except ImportError:
         # For TWO_FACTOR - this should have been checked at app init.
         raise
     from io import BytesIO
@@ -1055,8 +1081,7 @@ def create_blueprint(app, state, import_name, json_encoder=None):
     else:
         bp.route(state.login_url, methods=["GET", "POST"], endpoint="login")(login)
 
-    if config_value("FRESHNESS", app=app).total_seconds() >= 0:
-        bp.route(state.verify_url, methods=["GET", "POST"], endpoint="verify")(verify)
+    bp.route(state.verify_url, methods=["GET", "POST"], endpoint="verify")(verify)
 
     if state.unified_signin:
         bp.route(state.us_signin_url, methods=["GET", "POST"], endpoint="us_signin")(
@@ -1114,6 +1139,11 @@ def create_blueprint(app, state, import_name, json_encoder=None):
             methods=["GET", "POST"],
             endpoint="two_factor_rescue",
         )(two_factor_rescue)
+        bp.route(
+            state.two_factor_confirm_url,
+            methods=["GET", "POST"],
+            endpoint="two_factor_verify_password",
+        )(two_factor_verify_password)
 
     if state.registerable:
         bp.route(state.register_url, methods=["GET", "POST"], endpoint="register")(
