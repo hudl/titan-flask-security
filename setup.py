@@ -60,7 +60,7 @@ with open("flask_security/__init__.py") as f:
     # "passlib>=1.7.2",
 # ]
 
-packages = find_packages()
+# packages = find_packages()
 
 setup(
     name="Flask-Security-Too",
@@ -78,6 +78,7 @@ setup(
         "Code": "https://github.com/Flask-Middleware/flask-security",
         "Issue tracker": "https://github.com/Flask-Middleware/flask-security/issues",
     },
+    packages=['flask_security'],
     package_dir={'flask_security': 'src'}
     # packages=packages,
     # zip_safe=False,
