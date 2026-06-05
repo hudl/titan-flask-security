@@ -1,4 +1,6 @@
 exclude:
   global:
-    - flask_security.p3/decorators.py
+  - flask_security.p3/decorators.py
 
+  - "tests/**"
+  - "test_*.py"
